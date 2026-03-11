@@ -1,9 +1,11 @@
+import io
 import os
 import random
 import sys
 import time
 import tkinter as tk
 
+from pet.consts import OS_DARWIN
 from pet.utils import get_work_area
 
 
@@ -20,44 +22,25 @@ class Pet:
         assets_dir = os.path.join(base_dir, "assets")
         icon_path = os.path.join(base_dir, "icon.ico")
 
-        # === WINDOW ===
+        self._is_macos = sys.platform == OS_DARWIN
+
+        # === Tk root (event loop on all platforms, display on Windows only) ===
         self.window = tk.Tk()
-        self.window.overrideredirect(True)
-        self.window.attributes("-topmost", True)
-        self.window.config(highlightbackground="black")
-        self.window.wm_attributes("-transparentcolor", "black")
-        self.window.bind("<Escape>", lambda e: self.window.destroy())
 
-        # Window/taskbar icon
-        if os.path.exists(icon_path):
-            try:
-                self.window.iconbitmap(icon_path)
-            except Exception:
-                pass
-
-        # --- Right-click menu ---
-        self.menu = tk.Menu(self.window, tearoff=0)
-        self.menu.add_command(label="Pause/Resume (Space)", command=self.toggle_pause)
-        self.menu.add_separator()
-        self.menu.add_command(label="Exit", command=self.window.destroy)
+        if self._is_macos:
+            self._init_macos_display()
+        else:
+            self._init_windows_display(icon_path)
 
         # === Load animations from assets folder ===
         def load_frames(filename):
             path = os.path.join(assets_dir, filename)
-            frames = []
-            i = 0
-
             if not os.path.exists(path):
-                return frames
+                return []
 
-            while True:
-                try:
-                    frames.append(tk.PhotoImage(file=path, format=f"gif -index {i}"))
-                    i += 1
-                except tk.TclError:
-                    break
-
-            return frames
+            if self._is_macos:
+                return self._load_frames_macos(path)
+            return self._load_frames_tk(path)
 
         self.frames = {
             "walk_right": load_frames("walking_right.gif"),
@@ -119,16 +102,23 @@ class Pet:
         self._last_t = time.perf_counter()
         self.frame_index = 0
 
-        # Visual
-        self.label = tk.Label(self.window, bd=0, bg="black")
-        self.label.pack()
-        self.label.bind("<Button-3>", self.show_menu)
-
         # Drag & drop
         self._drag = None
-        self.label.bind("<Button-1>", self.start_drag)
-        self.label.bind("<B1-Motion>", self.on_drag)
-        self.label.bind("<ButtonRelease-1>", self.end_drag)
+
+        if not self._is_macos:
+            # --- Tk-only visual setup ---
+            self.label = tk.Label(self.window, bd=0, bg="black")
+            self.label.pack()
+            self.label.bind("<Button-3>", self.show_menu)
+            self.label.bind("<Button-1>", self.start_drag)
+            self.label.bind("<B1-Motion>", self.on_drag)
+            self.label.bind("<ButtonRelease-1>", self.end_drag)
+
+            # --- Right-click menu ---
+            self.menu = tk.Menu(self.window, tearoff=0)
+            self.menu.add_command(label="Pause/Resume (Space)", command=self.toggle_pause)
+            self.menu.add_separator()
+            self.menu.add_command(label="Exit", command=self._quit)
 
         # Work area and ground
         l, t, r, b = get_work_area()
@@ -139,16 +129,12 @@ class Pet:
 
         # Initial image
         self.current_frames = self.frames["walk_right"]
-        self.img = self.current_frames[self.frame_index]
-        self.label.configure(image=self.img)
-        self.label.image = self.img
-        self.w = self.img.width()
-        self.h = self.img.height()
+        self._set_frame(self.frame_index)
 
         # Spawn from above
         self.x = self.screen_left
         self.y = self.screen_top - self.h
-        self.window.geometry(f"{self.w}x{self.h}+{int(self.x)}+{int(self.y)}")
+        self._move_window()
 
         # Ground aligned to work area bottom
         self.ground_y = self.screen_bottom - self.h
@@ -184,12 +170,193 @@ class Pet:
         self.TURN_MAX = 15.0
         self.next_turn_time = now + random.uniform(self.TURN_MIN, self.TURN_MAX)
 
-        # Shortcuts
-        self.window.bind("<space>", lambda e: self.toggle_pause())
+        # Shortcuts (Tk-only; macOS uses NSEvent monitors set up in _init_macos_display)
+        if not self._is_macos:
+            self.window.bind("<Escape>", lambda e: self._quit())
+            self.window.bind("<space>", lambda e: self.toggle_pause())
 
         # Loop
         self.update()
         self.window.mainloop()
+
+    def _init_macos_display(self):
+        """Create a native transparent NSWindow; hide the Tk root."""
+        self.window.withdraw()
+
+        from AppKit import (
+            NSWindow, NSBackingStoreBuffered, NSColor,
+            NSImageView, NSImage, NSData, NSMakeRect,
+            NSScreen, NSEvent,
+            NSLeftMouseDownMask, NSLeftMouseDraggedMask,
+            NSLeftMouseUpMask, NSRightMouseDownMask,
+            NSKeyDownMask,
+            NSMenu, NSMenuItem,
+        )
+
+        self._NSImage = NSImage
+        self._NSData = NSData
+        self._NSMakeRect = NSMakeRect
+        self._screen_h = float(NSScreen.mainScreen().frame().size.height)
+
+        # Create transparent NSWindow (same recipe as ClearMenuBar)
+        self._ns_window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(0, 0, 128, 128), 0, NSBackingStoreBuffered, False,
+        )
+        self._ns_window.setOpaque_(False)
+        self._ns_window.setBackgroundColor_(NSColor.clearColor())
+        self._ns_window.setHasShadow_(False)
+        self._ns_window.setLevel_(25)  # NSStatusWindowLevel
+        self._ns_window.setAcceptsMouseMovedEvents_(True)
+
+        self._ns_image_view = NSImageView.alloc().initWithFrame_(NSMakeRect(0, 0, 128, 128))
+        self._ns_image_view.setImageScaling_(0)  # NSImageScaleNone
+        self._ns_window.setContentView_(self._ns_image_view)
+        self._ns_window.orderFront_(None)
+
+        # --- Right-click menu (native) ---
+        self._ns_menu = NSMenu.alloc().init()
+        pause_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Pause/Resume (Space)", None, "",
+        )
+        exit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Exit", None, "",
+        )
+        self._ns_menu.addItem_(pause_item)
+        self._ns_menu.addItem_(NSMenuItem.separatorItem())
+        self._ns_menu.addItem_(exit_item)
+
+        # --- Mouse event monitors ---
+        mouse_mask = (
+            NSLeftMouseDownMask | NSLeftMouseDraggedMask |
+            NSLeftMouseUpMask | NSRightMouseDownMask
+        )
+        pet = self  # prevent closure over self
+
+        def mouse_handler(event):
+            if event.window() is not None and event.window() != pet._ns_window:
+                return event
+
+            etype = event.type()
+            loc = event.locationInWindow()
+            local_x = int(loc.x)
+            local_y = pet.h - int(loc.y)  # flip Y to top-origin
+
+            if etype == 1:  # NSLeftMouseDown
+                pet.start_drag_native(local_x, local_y)
+            elif etype == 6:  # NSLeftMouseDragged
+                pet.on_drag_native(event)
+            elif etype == 2:  # NSLeftMouseUp
+                pet.end_drag_native(local_x, local_y)
+            elif etype == 3:  # NSRightMouseDown
+                # Show context menu
+                idx = pet._ns_menu.indexOfItemWithTitle_("Pause/Resume (Space)")
+                if idx >= 0:
+                    item = pet._ns_menu.itemAtIndex_(idx)
+                    item.setTitle_(
+                        "Resume (Space)" if pet.paused else "Pause (Space)"
+                    )
+                NSMenu.popUpContextMenu_withEvent_forView_(
+                    pet._ns_menu, event, pet._ns_image_view,
+                )
+                # Check which item was selected (by checking state change)
+                # Use simpler approach: named items
+            return event
+
+        NSEvent.addLocalMonitorForEventsMatchingMask_handler_(mouse_mask, mouse_handler)
+
+        # --- Keyboard event monitor ---
+        def key_handler(event):
+            kc = event.keyCode()
+            if kc == 53:  # Escape
+                pet._quit()
+            elif kc == 49:  # Space
+                pet.toggle_pause()
+            return event
+
+        NSEvent.addLocalMonitorForEventsMatchingMask_handler_(NSKeyDownMask, key_handler)
+
+        # Intercept NSMenu item clicks
+        self._ns_menu_pause = self._ns_menu.itemAtIndex_(0)
+        self._ns_menu_exit = self._ns_menu.itemAtIndex_(2)
+
+    def _init_windows_display(self, icon_path):
+        """Set up Tk window for Windows (original approach)."""
+        self.window.overrideredirect(True)
+        self.window.attributes("-topmost", True)
+        self.window.config(highlightbackground="black")
+        try:
+            self.window.wm_attributes("-transparentcolor", "black")
+        except tk.TclError:
+            pass
+
+        if os.path.exists(icon_path):
+            try:
+                self.window.iconbitmap(icon_path)
+            except Exception:
+                pass
+
+    def _load_frames_macos(self, path):
+        """Load GIF frames as NSImage objects via Pillow."""
+        from PIL import Image
+
+        frames = []
+        img = Image.open(path)
+        for i in range(img.n_frames):
+            img.seek(i)
+            rgba = img.convert("RGBA")
+            buf = io.BytesIO()
+            rgba.save(buf, format="PNG")
+            png_bytes = buf.getvalue()
+            ns_data = self._NSData.alloc().initWithBytes_length_(png_bytes, len(png_bytes))
+            ns_image = self._NSImage.alloc().initWithData_(ns_data)
+            frames.append(ns_image)
+        return frames
+
+    def _load_frames_tk(self, path):
+        """Load GIF frames as tk.PhotoImage objects."""
+        frames = []
+        i = 0
+        while True:
+            try:
+                frames.append(tk.PhotoImage(file=path, format=f"gif -index {i}"))
+                i += 1
+            except tk.TclError:
+                break
+        return frames
+
+    def _frame_size(self, frame):
+        if self._is_macos:
+            sz = frame.size()
+            return int(sz.width), int(sz.height)
+        return frame.width(), frame.height()
+
+    def _set_frame(self, index):
+        """Display frame at *index* from current_frames and update w/h."""
+        frame = self.current_frames[index]
+        if self._is_macos:
+            self._ns_image_view.setImage_(frame)
+        else:
+            self.label.configure(image=frame)
+            self.label.image = frame
+        self.w, self.h = self._frame_size(frame)
+
+    def _move_window(self):
+        """Position the display window at (self.x, self.y) with size (self.w, self.h)."""
+        if self._is_macos:
+            ns_y = self._screen_h - self.y - self.h
+            self._ns_window.setFrame_display_(
+                self._NSMakeRect(self.x, ns_y, self.w, self.h), True,
+            )
+            self._ns_image_view.setFrame_(self._NSMakeRect(0, 0, self.w, self.h))
+        else:
+            self.window.geometry(
+                f"{self.w}x{self.h}+{int(self.x)}+{int(self.y)}"
+            )
+
+    def _quit(self):
+        if self._is_macos:
+            self._ns_window.close()
+        self.window.destroy()
 
     def show_menu(self, event):
         self.menu.tk_popup(event.x_root, event.y_root)
@@ -205,14 +372,34 @@ class Pet:
     def on_drag(self, event):
         if self._drag is None:
             return
-
         dx = event.x - self._drag[0]
         dy = event.y - self._drag[1]
         self.x += dx
         self.y += dy
-        self.window.geometry(f"{self.w}x{self.h}+{int(self.x)}+{int(self.y)}")
+        self._move_window()
 
     def end_drag(self, event):
+        self._drag = None
+        self.swing_phase = 0
+        self.swinging = True
+        self.enter_state("walk")
+        self.do_swing()
+
+    def start_drag_native(self, local_x, local_y):
+        self._drag = (local_x, local_y)
+        self.direction = 1 if local_x >= self.w // 2 else -1
+        self.enter_state("drag", force=True)
+
+    def on_drag_native(self, event):
+        if self._drag is None:
+            return
+        dx = event.deltaX()
+        dy = event.deltaY()
+        self.x += dx
+        self.y += dy
+        self._move_window()
+
+    def end_drag_native(self, local_x, local_y):
         self._drag = None
         self.swing_phase = 0
         self.swinging = True
@@ -228,14 +415,18 @@ class Pet:
         xdir = 1 if self.direction >= 0 else -1
         xoff = int(xamp * (1 - abs(self.swing_phase - 5) / 5)) * xdir
 
-        self.window.geometry(
-            f"{self.w}x{self.h}+{int(self.x + xoff)}+{int(self.y - yoff)}"
-        )
+        # Temporary position offset for the swing
+        orig_x, orig_y = self.x, self.y
+        self.x += xoff
+        self.y -= yoff
+        self._move_window()
+        self.x, self.y = orig_x, orig_y
+
         self.swing_phase += 1
 
         if self.swing_phase > 10:
             self.swinging = False
-            self.window.geometry(f"{self.w}x{self.h}+{int(self.x)}+{int(self.y)}")
+            self._move_window()
             return
 
         self.window.after(30, self.do_swing)
@@ -286,23 +477,18 @@ class Pet:
         self.state = new_state
         self.frame_index = 0
         self.current_frames = self.pick_frames_by_state_dir(new_state)
-
-        self.img = self.current_frames[self.frame_index]
-        self.label.configure(image=self.img)
-        self.label.image = self.img
-        self.w = self.img.width()
-        self.h = self.img.height()
-        self.window.geometry(f"{self.w}x{self.h}+{int(self.x)}+{int(self.y)}")
+        self._set_frame(self.frame_index)
+        self._move_window()
 
         if new_state == "fire":
             self.y -= 5
             self.x -= self.direction * 8
-            self.window.geometry(f"{self.w}x{self.h}+{int(self.x)}+{int(self.y)}")
+            self._move_window()
 
         if new_state == "walk" and prev_state == "fire":
             self.y += 5
             self.x += self.direction * 8
-            self.window.geometry(f"{self.w}x{self.h}+{int(self.x)}+{int(self.y)}")
+            self._move_window()
 
         if new_state == "descend":
             self.vy = 0.0
@@ -383,9 +569,7 @@ class Pet:
             while self._acc >= target_ft:
                 self._acc -= target_ft
                 self.frame_index = (self.frame_index + 1) % len(self.current_frames)
-                self.img = self.current_frames[self.frame_index]
-                self.label.configure(image=self.img)
-                self.label.image = self.img
+                self._set_frame(self.frame_index)
 
             # Horizontal movement
             if self.state == "walk" and self.y >= self.ground_y:
@@ -408,7 +592,7 @@ class Pet:
                     self.enter_state("walk", force=True)
                     self.next_turn_time = now + random.uniform(self.TURN_MIN, self.TURN_MAX)
 
-            self.window.geometry(f"{self.w}x{self.h}+{int(self.x)}+{int(self.y)}")
+            self._move_window()
 
         self.window.after(10, self.update)
 
