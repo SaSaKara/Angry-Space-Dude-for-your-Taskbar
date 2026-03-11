@@ -1,1 +1,2 @@
-# No external dependencies required
+pillow>=12.0
+pyobjc-framework-Cocoa>=12.0; sys_platform == "darwin"
